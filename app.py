@@ -90,11 +90,6 @@ class StatisticalJumpModel:
 
 
 def extract_locked_expanding_features(returns_df, riskfree_col='RiskFree', hl_list=[1, 5, 10, 21]):
-    """
-    🔒 嚴格的逐期 Expanding（擴展窗口）標準化：
-    確保時間點 t 的特徵標準化數值，只取決於 t 當下及之前的歷史數據，
-    使過去的特徵數值永遠被鎖定，不因未來新數據加入而改變。
-    """
     risky_cols = [c for c in returns_df.columns if c != riskfree_col]
     features = {}
     for col in risky_cols:
@@ -117,7 +112,6 @@ def extract_locked_expanding_features(returns_df, riskfree_col='RiskFree', hl_li
     scaled_values = np.zeros_like(values)
     
     for i in range(len(values)):
-        # 歷史鎖定：標準化僅使用當下及過去的資料切片
         history_slice = values[:i+1] if i >= 12 else values[:max(i+1, 2)]
         mean_val = np.mean(history_slice, axis=0)
         std_val = np.std(history_slice, axis=0) + 1e-8
@@ -156,7 +150,6 @@ class DualRegimeAllocationModel:
         returns_df = returns_df.dropna()
         macro_df = macro_df.reindex(returns_df.index).ffill().bfill()
 
-        # 採用歷史鎖定的 Expanding 標準化特徵
         X_min = extract_locked_expanding_features(returns_df, riskfree_col=riskfree_col, hl_list=hl_list)
         X_comp = pd.concat([X_min, macro_df], axis=1).reindex(X_min.index).ffill().bfill()
         
@@ -212,7 +205,6 @@ class DualRegimeAllocationModel:
         asset_regimes_label_df = pd.DataFrame(asset_regimes_label, index=dates)
         y_global = pd.Series(global_regimes_label, index=dates).shift(-1).ffill().fillna(0)
 
-        # 🔒 嚴格 Walk-Forward 滾動式預測（採用極速 LogisticRegression，秒速完成運算）
         prob_global_bull = np.full(T, 0.5)
         min_train_size = max(6, T // 5)
         max_rolling_window = 60  
@@ -358,7 +350,6 @@ st.set_page_config(page_title="雙重狀態資產配置系統", layout="wide")
 st.title("📈 雙重狀態動態資產配置系統（歷史訊號永久鎖定版）")
 st.caption("已完美修復未來數據污染問題：歷史各結算日的特徵標準化與機器學習預測，均採用嚴格 Walk-Forward 擴展窗口，訊號一經生成永久固定不變。")
 
-# 登出按鈕
 if st.sidebar.button("🔒 登出系統"):
     st.session_state["password_correct"] = False
     st.rerun()
@@ -421,7 +412,15 @@ def fetch_real_market_data():
     macro_tickers = {'VIX': '^VIX'}
     all_tickers = list(tickers_map.values()) + list(macro_tickers.values())
     
-    df_raw = yf.download(all_tickers, start="2006-01-01", progress=False)
+    # 增加錯誤與逾時防護
+    try:
+        df_raw = yf.download(all_tickers, start="2006-01-01", progress=False, timeout=20)
+        if df_raw.empty:
+            raise ValueError("下載到的資料為空")
+    except Exception as e:
+        st.error(f"❌ Yahoo Finance 資料下載失敗或逾時: {e}")
+        return pd.DataFrame(), pd.DataFrame()
+
     if isinstance(df_raw.columns, pd.MultiIndex):
         df_prices = df_raw['Adj Close'] if 'Adj Close' in df_raw.columns else df_raw['Close']
     else:
@@ -445,6 +444,10 @@ def fetch_real_market_data():
 with st.spinner("正在同步真實金融市場與總經歷史數據..."):
     raw_returns_df, raw_macro_df = fetch_real_market_data()
 
+if raw_returns_df.empty or raw_macro_df.empty:
+    st.error("❌ 無法取得市場數據，請重新整理頁面或稍後再試（可能受 Yahoo Finance 連線限制）。")
+    st.stop()
+
 start_ts = pd.to_datetime(start_date)
 end_ts = pd.to_datetime(end_date)
 common_index = raw_returns_df.index.intersection(raw_macro_df.index)
@@ -461,24 +464,32 @@ if returns_df_input.empty or len(returns_df_input) < 30:
 
 if run_button or 'results' not in st.session_state:
     with st.spinner(f"正在執行 Walk-Forward 嚴格歷史鎖定運算 (模式：{defense_option} | 頻率：{rebal_freq_option})..."):
-        model_instance = DualRegimeAllocationModel(
-            jump_penalty_global=float(jp_global),
-            jump_penalty_asset=float(jp_asset),
-            prob_threshold=float(prob_thresh),
-            ewm_window=int(ewm_win),
-            rebalance_freq=chosen_freq,
-            momentum_lookback=int(mom_lb),
-            defense_mode=chosen_defense_mode
-        )
-        res_df, bmda_hist, bmga_hist, rebal_dates, returns_aligned, raw_probs = model_instance.run_pipeline(
-            returns_df_input.copy(), macro_df_input.copy(), global_proxy_col='S&P500', riskfree_col='RiskFree'
-        )
-        st.session_state['results'] = res_df
-        st.session_state['bmda'] = bmda_hist
-        st.session_state['bmga'] = bmga_hist
-        st.session_state['rebal_dates'] = rebal_dates
-        st.session_state['returns_aligned'] = returns_aligned
-        st.session_state['raw_probs'] = raw_probs
+        try:
+            model_instance = DualRegimeAllocationModel(
+                jump_penalty_global=float(jp_global),
+                jump_penalty_asset=float(jp_asset),
+                prob_threshold=float(prob_thresh),
+                ewm_window=int(ewm_win),
+                rebalance_freq=chosen_freq,
+                momentum_lookback=int(mom_lb),
+                defense_mode=chosen_defense_mode
+            )
+            res_df, bmda_hist, bmga_hist, rebal_dates, returns_aligned, raw_probs = model_instance.run_pipeline(
+                returns_df_input.copy(), macro_df_input.copy(), global_proxy_col='S&P500', riskfree_col='RiskFree'
+            )
+            st.session_state['results'] = res_df
+            st.session_state['bmda'] = bmda_hist
+            st.session_state['bmga'] = bmga_hist
+            st.session_state['rebal_dates'] = rebal_dates
+            st.session_state['returns_aligned'] = returns_aligned
+            st.session_state['raw_probs'] = raw_probs
+        except Exception as e:
+            st.error(f"❌ 模型運算過程發生錯誤: {e}")
+            st.stop()
+
+if 'results' not in st.session_state:
+    st.info("👈 請點擊左側側邊欄的『🚀 執行回測與分析』按鈕以開始。")
+    st.stop()
 
 res_df = st.session_state['results']
 bmda_hist = st.session_state['bmda']
@@ -605,3 +616,28 @@ fig_regime = make_subplots(
 )
 
 sp_prices_plot = (1 + benchmark_returns).cumprod()
+fig_regime.add_trace(
+    go.Scatter(x=sp_prices_plot.index, y=sp_prices_plot, name="S&P 500 走勢", line=dict(color='#1f77b4', width=2)),
+    row=1, col=1
+)
+
+bull_probs = res_df['Global_Bull_Prob']
+fig_regime.add_trace(
+    go.Scatter(x=bull_probs.index, y=bull_probs, name="牛市機率", line=dict(color='#ff7f0e', width=1.5)),
+    row=2, col=1
+)
+fig_regime.add_hline(y=0.5, line_dash="dash", line_color="gray", row=2, col=1, annotation_text="多空分界線 (0.5)")
+
+fig_regime.update_layout(
+    template="plotly_dark",
+    height=550,
+    hovermode="x unified",
+    legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
+)
+st.plotly_chart(fig_regime, use_container_width=True)
+
+st.markdown("---")
+
+st.subheader(f"📋 週期結算、預測與未來報酬驗證明細表 ({rebal_freq_option})")
+st.caption("明細表中已啟用歷史訊號永久鎖定，過去各結算日的訊號將固定不變：")
+st.dataframe(pd.DataFrame(period_records), use_container_width=True, height=400)
