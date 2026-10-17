@@ -1,0 +1,9 @@
+streamlit
+pandas
+numpy
+scipy
+scikit-learn
+plotly
+yfinance>=0.2.54
+curl_cffi
+xgboost
