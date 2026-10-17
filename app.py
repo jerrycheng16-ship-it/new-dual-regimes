@@ -578,4 +578,18 @@ fig_regime.add_trace(
     go.Scatter(x=bull_probs.index, y=bull_probs, name="牛市機率", line=dict(color='#ff7f0e', width=1.5)),
     row=2, col=1
 )
-fig_regime.add_hline(y=0.5, line_dash="dash", line_color="gray", row=2, col=1, annotation_
+fig_regime.add_hline(y=0.5, line_dash="dash", line_color="gray", row=2, col=1, annotation_text="多空分界線 (0.5)")
+
+fig_regime.update_layout(
+    template="plotly_dark",
+    height=550,
+    hovermode="x unified",
+    legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
+)
+st.plotly_chart(fig_regime, use_container_width=True)
+
+st.markdown("---")
+
+st.subheader(f"📋 週期結算、預測與未來報酬驗證明細表 ({rebal_freq_option})")
+st.caption("明細表中已啟用歷史訊號永久鎖定，過去各結算日的訊號將固定不變：")
+st.dataframe(pd.DataFrame(period_records), use_container_width=True, height=400)
