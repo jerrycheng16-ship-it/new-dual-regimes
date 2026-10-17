@@ -419,24 +419,4 @@ for i in range(len(dates_list)):
     else:
         prob = raw_probs[i] if i < len(raw_probs) else 0.5
         future_str = "⏳ 待下期結算"
-        ret_str = "N/A"
-        eval_result = "⏳ 待驗證"
-
-    is_bear = prob < 0.5
-    regime_str = "🐻 熊市防禦 (BMDA)" if is_bear else "🚀 牛市成長 (BMGA)"
-    assets = bmda_hist.get(d_signal, []) if is_bear else bmga_hist.get(d_signal, [])
-    
-    period_records.append({
-        "訊號生成日 (結算)": d_signal.strftime('%Y-%m-%d'),
-        "預驗證未來區間": future_str,
-        "牛市預測機率": f"{prob:.4f}",
-        "市場判定狀態": regime_str,
-        "S&P500 下期報酬率": ret_str,
-        "預測驗證": eval_result,
-        "當期配置資產池": ", ".join(assets)
-    })
-
-period_records.reverse()
-win_rate = (correct_count / total_count) * 100 if total_count > 0 else 0
-
-st.subheader(f"📊 核心績效指標與預測勝率 ({rebal_freq_option
+        ret_
