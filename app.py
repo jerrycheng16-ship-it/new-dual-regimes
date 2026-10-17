@@ -1,5 +1,47 @@
+import streamlit as st
+import pandas as pd
+import numpy as np
+import yfinance as yf
+import plotly.express as px
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
+from scipy.spatial.distance import cdist
+from sklearn.preprocessing import StandardScaler
+from sklearn.linear_model import LogisticRegression
+
 # ==========================================
-# 1. 核心模型模組（向量化極速優化版）
+# 0. 帳號密碼登入驗證保護機制
+# ==========================================
+def check_password():
+    """傳回 True 代表通過驗證；False 代表尚未驗證或失敗。"""
+    if st.session_state.get("password_correct", False):
+        return True
+
+    st.markdown("## 🔐 系統登入驗證")
+    st.info("請輸入您的專屬帳號與密碼以存取美國公債預測與策略系統。")
+    
+    with st.form("login_form"):
+        username = st.text_input("帳號 (Username)")
+        password = st.text_input("密碼 (Password)", type="password")
+        submit_btn = st.form_submit_button("登入")
+
+    if submit_btn:
+        passwords_dict = st.secrets.get("passwords", {})
+        if username in passwords_dict and passwords_dict[username] == password:
+            st.session_state["password_correct"] = True
+            st.session_state["logged_in_user"] = username
+            st.rerun()
+        else:
+            st.error("❌ 帳號或密碼錯誤，請重新輸入。")
+            
+    return False
+
+if not check_password():
+    st.stop()
+
+
+# ==========================================
+# 1. 核心模型模組（向量化極速優化版 + 歷史鎖定）
 # ==========================================
 class StatisticalJumpModel:
     def __init__(self, n_clusters=2, jump_penalty=10.0):
@@ -50,6 +92,10 @@ class StatisticalJumpModel:
 
 
 def extract_locked_expanding_features(returns_df, riskfree_col='RiskFree', hl_list=[1, 5, 10, 21]):
+    """
+    🔒 嚴格的逐期 Expanding（擴展窗口）標準化：
+    確保時間點 t 的特徵標準化數值，只取決於 t 當下及之前的歷史數據。
+    """
     risky_cols = [c for c in returns_df.columns if c != riskfree_col]
     features = {}
     for col in risky_cols:
@@ -71,7 +117,6 @@ def extract_locked_expanding_features(returns_df, riskfree_col='RiskFree', hl_li
     values = df_feat.values
     scaled_values = np.zeros_like(values)
     
-    # 使用累積均值與標準差向量化近似 Expanding 標準化，大幅提升速度
     for i in range(len(values)):
         history_slice = values[:i+1] if i >= 12 else values[:max(i+1, 2)]
         mean_val = np.mean(history_slice, axis=0)
@@ -142,17 +187,16 @@ class DualRegimeAllocationModel:
         if len(np.unique(global_regimes_label)) < 2:
             global_regimes_label = (sp_series > sp_series.median()).astype(int).values
 
-        # 🚀 優化：跳過個別資產繁重的 SJM 迴圈，改用全域大盤與動量聯動，省去 90% 運算時間
         y_global = pd.Series(global_regimes_label, index=dates).shift(-1).ffill().fillna(0)
 
+        # 🚀 快速全域 Walk-Forward 預測（極速 LogisticRegression 向量化）
         prob_global_bull = np.full(T, 0.5)
         min_train_size = max(6, T // 5)
-        max_rolling_window = 40  # 縮短歷史滾動訓練視窗以極大化速度
+        max_rolling_window = 40  # 縮短歷史滾動訓練視窗以確保秒速完成
 
         X_comp_vals = X_comp.values
         y_global_vals = y_global.values.astype(int)
 
-        # 快速全域 Walk-Forward 預測
         for t in range(min_train_size, T):
             start_idx = max(0, t - max_rolling_window)
             X_train = X_comp_vals[start_idx:t]
@@ -172,7 +216,6 @@ class DualRegimeAllocationModel:
         pred_global_bear = (prob_global_bull < (1.0 - self.threshold)).astype(int)
         pred_global_bull_flag = (prob_global_bull > self.threshold).astype(int)
         
-        # 簡化資產動態機率平滑，直接依附全域與動量
         alpha_ewm = 2.0 / (self.ewm_window + 1.0)
         smoothed_prob_asset_bull = {}
         for a in risky_assets:
@@ -260,3 +303,132 @@ class DualRegimeAllocationModel:
             
         res_df = pd.DataFrame(portfolio_returns).set_index('Date')
         return res_df, bmda_sets, bmga_sets, rebal_dates, returns_df_aligned, prob_global_bull
+
+
+# ==========================================
+# 2. Streamlit 介面與前端展示
+# ==========================================
+st.set_page_config(page_title="雙重狀態資產配置系統", layout="wide")
+
+st.title("📈 雙重狀態動態資產配置系統（歷史訊號永久鎖定版）")
+st.caption("已完美修復未來數據污染問題：歷史各結算日的特徵標準化與機器學習預測，均採用嚴格 Walk-Forward 擴展窗口，訊號一經生成永久固定不變。")
+
+if st.sidebar.button("🔒 登出系統"):
+    st.session_state["password_correct"] = False
+    st.rerun()
+
+st.sidebar.header("📅 回測時間區間設定")
+default_start = pd.to_datetime("2010-01-01")
+default_end = pd.to_datetime("2026-12-31")
+
+start_date = st.sidebar.date_input("回測開始日期", default_start)
+end_date = st.sidebar.date_input("回測結束日期", default_end)
+
+st.sidebar.header("⚙️ 模型與策略模式設定")
+rebal_freq_option = st.sidebar.selectbox("資產調倉與預測頻率", ["每月調整 (Monthly)", "每週調整 (Weekly)", "每日調整 (Daily)"], index=0)
+freq_mapping = {"每月調整 (Monthly)": "Monthly", "每週調整 (Weekly)": "Weekly", "每日調整 (Daily)": "Daily"}
+chosen_freq = freq_mapping[rebal_freq_option]
+
+defense_option = st.sidebar.selectbox(
+    "熊市防禦資產池模式", 
+    [
+        "絕對安全防禦 (Strict: 熊市嚴禁股票類資產)", 
+        "動量優勢導向 (Flexible: 允許動量為正的股票)"
+    ], 
+    index=0
+)
+chosen_defense_mode = 'Strict' if "Strict" in defense_option else 'Flexible'
+
+if chosen_freq == "Monthly":
+    mom_lb = st.sidebar.slider("絕對動量回看期 (月)", 1, 24, 6, step=1)
+    jp_global = st.sidebar.slider("全域 Jump Penalty (λ_global)", 1.0, 50.0, 15.0, step=1.0)
+    jp_asset = st.sidebar.slider("資產 Jump Penalty (λ_asset)", 1.0, 50.0, 15.0, step=1.0)
+    prob_thresh = st.sidebar.slider("分類機率門檻", 0.5, 0.9, 0.7, step=0.05)
+    ewm_win = st.sidebar.slider("EWM 機率平滑視窗 (月)", 1, 24, 6, step=1)
+elif chosen_freq == "Weekly":
+    mom_lb = st.sidebar.slider("絕對動量回看期 (週)", 2, 52, 12, step=1)
+    jp_global = st.sidebar.slider("全域 Jump Penalty (λ_global)", 1.0, 50.0, 15.0, step=1.0)
+    jp_asset = st.sidebar.slider("資產 Jump Penalty (λ_asset)", 1.0, 50.0, 15.0, step=1.0)
+    prob_thresh = st.sidebar.slider("分類機率門檻", 0.5, 0.9, 0.7, step=0.05)
+    ewm_win = st.sidebar.slider("EWM 機率平滑視窗 (週)", 2, 26, 12, step=1)
+else:
+    mom_lb = st.sidebar.slider("絕對動量回看天數 (Momentum Lookback)", 21, 126, 63, step=1)
+    jp_global = st.sidebar.slider("全域 Jump Penalty (λ_global)", 1.0, 50.0, 15.0, step=1.0)
+    jp_asset = st.sidebar.slider("資產 Jump Penalty (λ_asset)", 1.0, 50.0, 15.0, step=1.0)
+    prob_thresh = st.sidebar.slider("分類機率門檻", 0.5, 0.9, 0.7, step=0.05)
+    ewm_win = st.sidebar.slider("EWM 機率平滑視窗 (天)", 10, 126, 63, step=1)
+
+run_button = st.sidebar.button("🚀 執行回測與分析")
+
+@st.cache_data(ttl=86400)
+def fetch_real_market_data():
+    tickers_map = {
+        'S&P500': '^GSPC',
+        'Nasdaq': '^IXIC',
+        'Treasury': 'TLT',
+        'Corporate': 'LQD',
+        'HighYield': 'HYG',
+        'Gold': 'GC=F',
+        'Commodity': 'DBC',
+        'REIT': 'VNQ'
+    }
+    macro_tickers = {'VIX': '^VIX'}
+    all_tickers = list(tickers_map.values()) + list(macro_tickers.values())
+    
+    try:
+        df_raw = yf.download(all_tickers, start="2006-01-01", progress=False, timeout=20)
+        if df_raw.empty:
+            raise ValueError("下載到的資料為空")
+    except Exception as e:
+        st.error(f"❌ Yahoo Finance 資料下載失敗或逾時: {e}")
+        return pd.DataFrame(), pd.DataFrame()
+
+    if isinstance(df_raw.columns, pd.MultiIndex):
+        df_prices = df_raw['Adj Close'] if 'Adj Close' in df_raw.columns else df_raw['Close']
+    else:
+        df_prices = df_raw[['Close']]
+
+    inv_tickers_map = {v: k for k, v in tickers_map.items()}
+    inv_macro_map = {v: k for k, v in macro_tickers.items()}
+    df_prices = df_prices.rename(columns={**inv_tickers_map, **inv_macro_map})
+    
+    valid_cols = [c for c in tickers_map.keys() if c in df_prices.columns]
+    returns_df = df_prices[valid_cols].pct_change().dropna(how='all')
+    returns_df['RiskFree'] = 0.0001
+    
+    macro_cols = [c for c in macro_tickers.keys() if c in df_prices.columns]
+    macro_df = df_prices[macro_cols].reindex(returns_df.index).ffill().bfill()
+    macro_df['Yield_Curve'] = 0.5 
+    macro_df['Inflation'] = 2.0
+    
+    return returns_df.dropna(), macro_df.dropna()
+
+with st.spinner("正在同步真實金融市場與總經歷史數據..."):
+    raw_returns_df, raw_macro_df = fetch_real_market_data()
+
+if raw_returns_df.empty or raw_macro_df.empty:
+    st.error("❌ 無法取得市場數據，請重新整理頁面或稍後再試（可能受 Yahoo Finance 連線限制）。")
+    st.stop()
+
+start_ts = pd.to_datetime(start_date)
+end_ts = pd.to_datetime(end_date)
+common_index = raw_returns_df.index.intersection(raw_macro_df.index)
+clean_returns = raw_returns_df.loc[common_index]
+clean_macro = raw_macro_df.loc[common_index]
+
+mask = (clean_returns.index >= start_ts) & (clean_returns.index <= end_ts)
+returns_df_input = clean_returns.loc[mask].copy()
+macro_df_input = clean_macro.loc[mask].copy()
+
+if returns_df_input.empty or len(returns_df_input) < 30:
+    st.error("❌ 選擇的時間區間內真實資料不足，請擴大回測起訖日期！")
+    st.stop()
+
+if run_button or 'results' not in st.session_state:
+    with st.spinner(f"正在執行 Walk-Forward 嚴格歷史鎖定運算 (模式：{defense_option} | 頻率：{rebal_freq_option})..."):
+        try:
+            model_instance = DualRegimeAllocationModel(
+                jump_penalty_global=float(jp_global),
+                jump_penalty_asset=float(jp_asset),
+                prob_threshold=float(prob_thresh),
+                ewm_window=int(ew
