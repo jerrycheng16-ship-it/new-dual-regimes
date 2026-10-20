@@ -1,22 +1,18 @@
 import streamlit as st
-import pandas as pd
-import numpy as np
-import yfinance as yf
-import plotly.express as px
-import plotly.graph_objects as go
-from plotly.subplots import make_subplots
-from scipy.spatial.distance import cdist
-from sklearn.linear_model import LogisticRegression
 
 # ==========================================
 # 0. 帳號密碼登入驗證保護機制
 # ==========================================
 def check_password():
+    """傳回 True 代表通過驗證；False 代表尚未驗證或失敗。"""
+    
+    # 檢查是否已經在 session_state 記錄為已登入
     if st.session_state.get("password_correct", False):
         return True
 
+    # 建立一個好看的登入表單
     st.markdown("## 🔐 系統登入驗證")
-    st.info("請輸入您的專屬帳號與密碼以存取系統。")
+    st.info("請輸入您的專屬帳號與密碼以存取美國公債預測與策略系統。")
     
     with st.form("login_form"):
         username = st.text_input("帳號 (Username)")
@@ -24,21 +20,52 @@ def check_password():
         submit_btn = st.form_submit_button("登入")
 
     if submit_btn:
+        # 從 st.secrets 中讀取設定好的密碼字典
         passwords_dict = st.secrets.get("passwords", {})
+        
         if username in passwords_dict and passwords_dict[username] == password:
             st.session_state["password_correct"] = True
-            st.rerun()
+            st.session_state["logged_in_user"] = username
+            st.rerun()  # 驗證成功後重新整理頁面進入主系統
         else:
             st.error("❌ 帳號或密碼錯誤，請重新輸入。")
             
     return False
 
+# 執行登入檢查：如果沒通過，就直接停止執行後續程式碼
 if not check_password():
     st.stop()
 
+# ==========================================
+# 接下來放您原本的主程式碼...
+# ==========================================
+st.success(f"歡迎回來，{st.session_state.get('logged_in_user')}！")
+
+# 這裡可以加上一個「登出」按鈕方便切換
+if st.sidebar.button("🔒 登出系統"):
+    st.session_state["password_correct"] = False
+    st.rerun()
+
+# (您原本的 import、側邊欄參數、模型運算、圖表顯示等程式碼接在這邊...)
+import streamlit as st
+import pandas as pd
+import numpy as np
+import yfinance as yf
+import plotly.express as px
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
+from scipy.spatial.distance import cdist
+from sklearn.preprocessing import StandardScaler
+
+try:
+    from xgboost import XGBClassifier
+    USE_XGB = True
+except ImportError:
+    from sklearn.ensemble import RandomForestClassifier as XGBClassifier
+    USE_XGB = False
 
 # ==========================================
-# 1. 還原原本的 StatisticalJumpModel 與歷史鎖定模組
+# 1. 核心模型模組
 # ==========================================
 class StatisticalJumpModel:
     def __init__(self, n_clusters=2, jump_penalty=10.0):
@@ -56,7 +83,7 @@ class StatisticalJumpModel:
         centroids = X[idx].copy()
         prev_states = np.zeros(T, dtype=int)
         
-        for iteration in range(15):
+        for iteration in range(20):
             emission_cost = cdist(X, centroids, metric='sqeuclidean')
             dp = np.zeros((T, K))
             pointers = np.zeros((T, K), dtype=int)
@@ -79,15 +106,14 @@ class StatisticalJumpModel:
             prev_states = states.copy()
             
             for k in range(K):
-                mask = (states == k)
-                if np.any(mask):
-                    centroids[k] = np.mean(X[mask], axis=0)
+                if np.sum(states == k) > 0:
+                    centroids[k] = np.mean(X[states == k], axis=0)
                     
         self.centroids = centroids
         return states
 
 
-def extract_locked_expanding_features(returns_df, riskfree_col='RiskFree', hl_list=[1, 5, 10, 21]):
+def extract_minimalist_features(returns_df, riskfree_col='RiskFree', hl_list=[1, 5, 10, 21]):
     risky_cols = [c for c in returns_df.columns if c != riskfree_col]
     features = {}
     for col in risky_cols:
@@ -106,27 +132,39 @@ def extract_locked_expanding_features(returns_df, riskfree_col='RiskFree', hl_li
     df_feat = pd.DataFrame(features, index=returns_df.index).dropna()
     df_feat = df_feat.loc[:, df_feat.var() > 1e-8]
     
-    values = df_feat.values
-    scaled_values = np.zeros_like(values)
-    
-    # 🔒 嚴格歷史鎖定標準化（Expanding 累積窗口）
-    for i in range(len(values)):
-        history_slice = values[:i+1] if i >= 12 else values[:max(i+1, 2)]
-        mean_val = np.mean(history_slice, axis=0)
-        std_val = np.std(history_slice, axis=0) + 1e-8
-        scaled_values[i] = (values[i] - mean_val) / std_val
-
-    return pd.DataFrame(scaled_values, index=df_feat.index, columns=df_feat.columns)
+    scaler = StandardScaler()
+    scaled_vals = scaler.fit_transform(df_feat.values)
+    return pd.DataFrame(scaled_vals, index=df_feat.index, columns=df_feat.columns)
 
 
-class OriginalJumpRegimeModel:
-    def __init__(self, jump_penalty_global=20.0, prob_threshold=0.7, ewm_window=12, rebalance_freq='Monthly', momentum_lookback=6, defense_mode='Strict'):
+class DualRegimeAllocationModel:
+    def __init__(self, jump_penalty_global=20.0, jump_penalty_asset=20.0, prob_threshold=0.7, ewm_window=12, rebalance_freq='Monthly', momentum_lookback=6, defense_mode='Strict'):
         self.jp_global = float(jump_penalty_global)
+        self.jp_asset = float(jump_penalty_asset)
         self.threshold = float(prob_threshold)
         self.ewm_window = int(ewm_window)
         self.rebal_freq = rebalance_freq
         self.mom_lookback = int(momentum_lookback)
         self.defense_mode = defense_mode
+        
+    def _create_classifier(self):
+        if USE_XGB:
+            return XGBClassifier(n_estimators=100, max_depth=3, random_state=42, eval_metric='logloss')
+        else:
+            return XGBClassifier(n_estimators=100, max_depth=3, random_state=42)
+
+    def _safe_fit_predict_proba(self, X_train, y_train, X_all):
+        unique_classes = np.unique(y_train)
+        if len(unique_classes) < 2:
+            y_train = y_train.copy()
+            mid = len(y_train) // 2
+            y_train[:mid] = 0
+            y_train[mid:] = 1
+            
+        clf = self._create_classifier()
+        clf.fit(X_train, y_train)
+        probs = clf.predict_proba(X_all)
+        return probs[:, 1] if probs.shape[1] > 1 else np.full(len(X_all), 0.5)
 
     def run_pipeline(self, raw_returns_df, raw_macro_df, global_proxy_col='S&P500', riskfree_col='RiskFree'):
         if self.rebal_freq == 'Monthly':
@@ -148,8 +186,7 @@ class OriginalJumpRegimeModel:
         returns_df = returns_df.dropna()
         macro_df = macro_df.reindex(returns_df.index).ffill().bfill()
 
-        # 1. 歷史鎖定特徵萃取
-        X_min = extract_locked_expanding_features(returns_df, riskfree_col=riskfree_col, hl_list=hl_list)
+        X_min = extract_minimalist_features(returns_df, riskfree_col=riskfree_col, hl_list=hl_list)
         X_comp = pd.concat([X_min, macro_df], axis=1).reindex(X_min.index).ffill().bfill()
         
         common_idx = X_comp.index.intersection(returns_df.index)
@@ -158,13 +195,11 @@ class OriginalJumpRegimeModel:
         
         risky_assets = [c for c in returns_df_aligned.columns if c not in [global_proxy_col, riskfree_col]]
         dates = common_idx
-        T = len(dates)
         
         global_min_feat = [c for c in X_comp.columns if global_proxy_col in c]
         if not global_min_feat:
             global_min_feat = list(X_comp.columns[:3])
-
-        # 2. 運用原本的 StatisticalJumpModel 進行全域狀態識別
+            
         sjm_global = StatisticalJumpModel(n_clusters=2, jump_penalty=self.jp_global)
         global_states = sjm_global.fit_predict(X_comp[global_min_feat].values)
         
@@ -181,55 +216,67 @@ class OriginalJumpRegimeModel:
         if len(np.unique(global_regimes_label)) < 2:
             global_regimes_label = (sp_series > sp_series.median()).astype(int).values
 
-        y_global = pd.Series(global_regimes_label, index=dates).shift(-1).ffill().fillna(0)
-
-        # 3. 🔒 嚴格 Walk-Forward 滾動式預測（結合 StatisticalJumpModel 狀態與機器學習分類器）
-        prob_global_bull = np.full(T, 0.5)
-        min_train_size = max(12, T // 6)
-        max_rolling_window = 60  # 滾動視窗 60 期，確保模型反應靈敏且不卡頓
-
-        X_comp_vals = X_comp.values
-        y_global_vals = y_global.values.astype(int)
-
-        for t in range(min_train_size, T):
-            start_idx = max(0, t - max_rolling_window)
-            X_train = X_comp_vals[start_idx:t]
-            y_train = y_global_vals[start_idx:t]
-            X_current = X_comp_vals[t:t+1]
+        asset_regimes_label = {}
+        for a in risky_assets:
+            a_min_feat = [c for c in X_comp.columns if a in c]
+            if not a_min_feat:
+                continue
+            sjm_asset = StatisticalJumpModel(n_clusters=2, jump_penalty=self.jp_asset)
+            a_states = sjm_asset.fit_predict(X_comp[a_min_feat].values)
+            a_series = returns_df_aligned.loc[dates, a]
+            a_sma = a_series.rolling(window=sma_window, min_periods=1).mean()
+            a_trend = (a_series > a_sma).astype(int).values
             
-            if len(np.unique(y_train)) < 2:
-                y_train = y_train.copy()
-                y_train[0] = 0
-                y_train[-1] = 1
-                
-            clf = LogisticRegression(max_iter=300, solver='lbfgs', random_state=42)
-            clf.fit(X_train, y_train)
-            probs = clf.predict_proba(X_current)
-            prob_global_bull[t] = probs[0, 1] if probs.shape[1] > 1 else 0.5
+            ret_a0 = a_series[a_states == 0].mean()
+            ret_a1 = a_series[a_states == 1].mean()
+            a_bull_state = 1 if ret_a1 > ret_a0 else 0
+            a_sjm = (a_states == a_bull_state).astype(int)
+            
+            a_label = np.where((a_trend == 1) | (a_sjm == 1), 1, 0)
+            if len(np.unique(a_label)) < 2:
+                a_label = (a_series > a_series.median()).astype(int).values
+            asset_regimes_label[a] = a_label
+            
+        asset_regimes_label_df = pd.DataFrame(asset_regimes_label, index=dates)
 
+        y_global = pd.Series(global_regimes_label, index=dates).shift(-1).ffill().fillna(0)
+        X_train_g = X_comp.iloc[:-1].values
+        y_train_g = y_global.iloc[:-1].values.astype(int)
+        
+        prob_global_bull = self._safe_fit_predict_proba(X_train_g, y_train_g, X_comp.values)
+        
         pred_global_bear = (prob_global_bull < (1.0 - self.threshold)).astype(int)
-        pred_global_bull_flag = (prob_global_bull > self.threshold).astype(int)
+        pred_global_bull = (prob_global_bull > self.threshold).astype(int)
         
         alpha_ewm = 2.0 / (self.ewm_window + 1.0)
         smoothed_prob_asset_bull = {}
+        
         for a in risky_assets:
-            a_prob = pd.Series(prob_global_bull, index=dates)
-            smoothed_prob_asset_bull[a] = a_prob.ewm(alpha=alpha_ewm).mean()
+            if a not in asset_regimes_label_df.columns:
+                continue
+            y_asset = asset_regimes_label_df[a].shift(-1).ffill().fillna(0)
+            X_train_a = X_comp.iloc[:-1].values
+            y_train_a = y_asset.iloc[:-1].values.astype(int)
             
-        smoothed_prob_asset_df = pd.DataFrame(smoothed_prob_asset_bull, index=dates)
+            raw_prob_bull = self._safe_fit_predict_proba(X_train_a, y_train_a, X_comp.values)
+            prob_series = pd.Series(raw_prob_bull, index=dates)
+            smoothed_prob_asset_bull[a] = prob_series.ewm(alpha=alpha_ewm).mean()
+            
+        smoothed_prob_asset_df = pd.DataFrame(smoothed_prob_asset_bull)
 
         price_levels = (1 + returns_df_aligned[risky_assets]).cumprod()
         mom_matrix = price_levels / price_levels.shift(self.mom_lookback) - 1
         mom_matrix = mom_matrix.fillna(1.0)
 
         stock_like_assets = ['Nasdaq', 'S&P500']
+
         bmda_sets = {}
         bmga_sets = {}
         
         for t in range(len(dates)):
             d = dates[t]
             is_global_bear = pred_global_bear[t] == 1
-            is_global_bull = pred_global_bull_flag[t] == 1
+            is_global_bull = pred_global_bull[t] == 1
             
             if d in smoothed_prob_asset_df.index:
                 asset_bulls = smoothed_prob_asset_df.loc[d] > self.threshold
@@ -248,6 +295,7 @@ class OriginalJumpRegimeModel:
                     selected_bmda = [a for a in filtered_risky if a not in stock_like_assets]
                 else:
                     selected_bmda = filtered_risky.copy()
+                
                 selected_bmda.append(riskfree_col)
                 bmda_sets[d] = selected_bmda
             else:
@@ -264,6 +312,7 @@ class OriginalJumpRegimeModel:
                 bmga_sets[d] = [global_proxy_col]
 
         rebal_dates = set(dates)
+
         portfolio_returns = []
         tc_rate = 0.0010
         prev_weights = pd.Series(0.0, index=returns_df_aligned.columns)
@@ -302,14 +351,10 @@ class OriginalJumpRegimeModel:
 # ==========================================
 # 2. Streamlit 介面與前端展示
 # ==========================================
-st.set_page_config(page_title="Statistical Jump Model 雙重狀態資產配置", layout="wide")
+st.set_page_config(page_title="雙重狀態資產配置系統", layout="wide")
 
-st.title("📈 Statistical Jump Model 雙重狀態動態資產配置系統")
-st.caption("已成功找回原汁原味的 StatisticalJumpModel 動態規劃分群核心，並嚴格採用 Walk-Forward 歷史鎖定（無未來資料污染）。")
-
-if st.sidebar.button("🔒 登出系統"):
-    st.session_state["password_correct"] = False
-    st.rerun()
+st.title("📈 雙重狀態動態資產配置系統（完整訊號顯示版）")
+st.caption("結合 SJM、機器學習、絕對動量濾網，明細表已完整包含最新收盤訊號。")
 
 st.sidebar.header("📅 回測時間區間設定")
 default_start = pd.to_datetime("2010-01-01")
@@ -335,17 +380,20 @@ chosen_defense_mode = 'Strict' if "Strict" in defense_option else 'Flexible'
 
 if chosen_freq == "Monthly":
     mom_lb = st.sidebar.slider("絕對動量回看期 (月)", 1, 24, 6, step=1)
-    jp_global = st.sidebar.slider("全域 Jump Penalty (λ_global)", 1.0, 50.0, 20.0, step=1.0)
+    jp_global = st.sidebar.slider("全域 Jump Penalty (λ_global)", 1.0, 50.0, 15.0, step=1.0)
+    jp_asset = st.sidebar.slider("資產 Jump Penalty (λ_asset)", 1.0, 50.0, 15.0, step=1.0)
     prob_thresh = st.sidebar.slider("分類機率門檻", 0.5, 0.9, 0.7, step=0.05)
     ewm_win = st.sidebar.slider("EWM 機率平滑視窗 (月)", 1, 24, 6, step=1)
 elif chosen_freq == "Weekly":
     mom_lb = st.sidebar.slider("絕對動量回看期 (週)", 2, 52, 12, step=1)
-    jp_global = st.sidebar.slider("全域 Jump Penalty (λ_global)", 1.0, 50.0, 20.0, step=1.0)
+    jp_global = st.sidebar.slider("全域 Jump Penalty (λ_global)", 1.0, 50.0, 15.0, step=1.0)
+    jp_asset = st.sidebar.slider("資產 Jump Penalty (λ_asset)", 1.0, 50.0, 15.0, step=1.0)
     prob_thresh = st.sidebar.slider("分類機率門檻", 0.5, 0.9, 0.7, step=0.05)
     ewm_win = st.sidebar.slider("EWM 機率平滑視窗 (週)", 2, 26, 12, step=1)
 else:
     mom_lb = st.sidebar.slider("絕對動量回看天數 (Momentum Lookback)", 21, 126, 63, step=1)
-    jp_global = st.sidebar.slider("全域 Jump Penalty (λ_global)", 1.0, 50.0, 20.0, step=1.0)
+    jp_global = st.sidebar.slider("全域 Jump Penalty (λ_global)", 1.0, 50.0, 15.0, step=1.0)
+    jp_asset = st.sidebar.slider("資產 Jump Penalty (λ_asset)", 1.0, 50.0, 15.0, step=1.0)
     prob_thresh = st.sidebar.slider("分類機率門檻", 0.5, 0.9, 0.7, step=0.05)
     ewm_win = st.sidebar.slider("EWM 機率平滑視窗 (天)", 10, 126, 63, step=1)
 
@@ -366,14 +414,7 @@ def fetch_real_market_data():
     macro_tickers = {'VIX': '^VIX'}
     all_tickers = list(tickers_map.values()) + list(macro_tickers.values())
     
-    try:
-        df_raw = yf.download(all_tickers, start="2006-01-01", progress=False, timeout=20)
-        if df_raw.empty:
-            raise ValueError("下載到的資料為空")
-    except Exception as e:
-        st.error(f"❌ Yahoo Finance 資料下載失敗或逾時: {e}")
-        return pd.DataFrame(), pd.DataFrame()
-
+    df_raw = yf.download(all_tickers, start="2006-01-01", progress=False)
     if isinstance(df_raw.columns, pd.MultiIndex):
         df_prices = df_raw['Adj Close'] if 'Adj Close' in df_raw.columns else df_raw['Close']
     else:
@@ -397,10 +438,6 @@ def fetch_real_market_data():
 with st.spinner("正在同步真實金融市場與總經歷史數據..."):
     raw_returns_df, raw_macro_df = fetch_real_market_data()
 
-if raw_returns_df.empty or raw_macro_df.empty:
-    st.error("❌ 無法取得市場數據，請重新整理頁面或稍後再試。")
-    st.stop()
-
 start_ts = pd.to_datetime(start_date)
 end_ts = pd.to_datetime(end_date)
 common_index = raw_returns_df.index.intersection(raw_macro_df.index)
@@ -416,32 +453,25 @@ if returns_df_input.empty or len(returns_df_input) < 30:
     st.stop()
 
 if run_button or 'results' not in st.session_state:
-    with st.spinner(f"正在執行 Statistical Jump Model 歷史鎖定運算 (模式：{defense_option} | 頻率：{rebal_freq_option})..."):
-        try:
-            model_instance = OriginalJumpRegimeModel(
-                jump_penalty_global=float(jp_global),
-                prob_threshold=float(prob_thresh),
-                ewm_window=int(ewm_win),
-                rebalance_freq=chosen_freq,
-                momentum_lookback=int(mom_lb),
-                defense_mode=chosen_defense_mode
-            )
-            res_df, bmda_hist, bmga_hist, rebal_dates, returns_aligned, raw_probs = model_instance.run_pipeline(
-                returns_df_input.copy(), macro_df_input.copy(), global_proxy_col='S&P500', riskfree_col='RiskFree'
-            )
-            st.session_state['results'] = res_df
-            st.session_state['bmda'] = bmda_hist
-            st.session_state['bmga'] = bmga_hist
-            st.session_state['rebal_dates'] = rebal_dates
-            st.session_state['returns_aligned'] = returns_aligned
-            st.session_state['raw_probs'] = raw_probs
-        except Exception as e:
-            st.error(f"❌ 模型運算過程發生錯誤: {e}")
-            st.stop()
-
-if 'results' not in st.session_state:
-    st.info("👈 請點擊左側側邊欄的『🚀 執行回測與分析』按鈕以開始。")
-    st.stop()
+    with st.spinner(f"模型運算中 (模式：{defense_option} | 頻率：{rebal_freq_option})..."):
+        model_instance = DualRegimeAllocationModel(
+            jump_penalty_global=float(jp_global),
+            jump_penalty_asset=float(jp_asset),
+            prob_threshold=float(prob_thresh),
+            ewm_window=int(ewm_win),
+            rebalance_freq=chosen_freq,
+            momentum_lookback=int(mom_lb),
+            defense_mode=chosen_defense_mode
+        )
+        res_df, bmda_hist, bmga_hist, rebal_dates, returns_aligned, raw_probs = model_instance.run_pipeline(
+            returns_df_input.copy(), macro_df_input.copy(), global_proxy_col='S&P500', riskfree_col='RiskFree'
+        )
+        st.session_state['results'] = res_df
+        st.session_state['bmda'] = bmda_hist
+        st.session_state['bmga'] = bmga_hist
+        st.session_state['rebal_dates'] = rebal_dates
+        st.session_state['returns_aligned'] = returns_aligned
+        st.session_state['raw_probs'] = raw_probs
 
 res_df = st.session_state['results']
 bmda_hist = st.session_state['bmda']
@@ -458,7 +488,7 @@ period_name = "最近一月" if chosen_freq == "Monthly" else ("最近一週" if
 st.subheader(f"🎯 依據【{rebal_freq_option}】產生的【{period_name}】市場訊號與建議配置")
 
 dates_index = sorted(list(returns_aligned.index))
-latest_signal_date = dates_index[-1] 
+latest_signal_date = dates_index[-1] # 直接抓取最新一天（包含昨天）
 
 latest_prob = raw_probs[-1] if len(raw_probs) > 0 else 0.5
 is_latest_bear = latest_prob < 0.5
@@ -472,7 +502,7 @@ c3.metric("建議配置資產池", ", ".join(latest_assets))
 st.markdown("---")
 
 # ==========================================
-# 4. 績效與預測勝率計算
+# 4. 績效與預測勝率計算（包含最新未驗證訊號）
 # ==========================================
 cum_returns = (1 + res_df['Return']).cumprod()
 annual_factor = 12 if chosen_freq == "Monthly" else (52 if chosen_freq == "Weekly" else 252)
@@ -493,10 +523,10 @@ period_records = []
 
 dates_list = sorted(list(returns_aligned.index))
 for i in range(len(dates_list)):
-    d_signal = dates_list[i]     
+    d_signal = dates_list[i]     # 訊號生成日
     
     if i < len(dates_list) - 1:
-        d_next = dates_list[i+1]     
+        d_next = dates_list[i+1]     # 驗證報酬率的未來期
         prob = res_df.loc[d_next, 'Global_Bull_Prob'] if d_next in res_df.index else raw_probs[i]
         period_sp_ret = returns_aligned.loc[d_next, 'S&P500'] if d_next in returns_aligned.index else 0.0
         
@@ -517,6 +547,7 @@ for i in range(len(dates_list)):
         ret_str = f"{period_sp_ret * 100:.2f}%"
         future_str = d_next.strftime('%Y-%m-%d')
     else:
+        # 最後一天（最新收盤日，如昨天），尚未有下期報酬可驗證
         prob = raw_probs[i] if i < len(raw_probs) else 0.5
         future_str = "⏳ 待下期結算"
         ret_str = "N/A"
@@ -536,7 +567,9 @@ for i in range(len(dates_list)):
         "當期配置資產池": ", ".join(assets)
     })
 
+# 反轉列表讓最新的一筆（昨天）排在最上方
 period_records.reverse()
+
 win_rate = (correct_count / total_count) * 100 if total_count > 0 else 0
 
 st.subheader(f"📊 核心績效指標與預測勝率 ({rebal_freq_option})")
@@ -591,5 +624,5 @@ st.plotly_chart(fig_regime, use_container_width=True)
 st.markdown("---")
 
 st.subheader(f"📋 週期結算、預測與未來報酬驗證明細表 ({rebal_freq_option})")
-st.caption("明細表中已啟用歷史訊號永久鎖定，過去各結算日的訊號將固定不變：")
+st.caption("明細表中已包含最新收盤日的訊號（最上方會顯示『待下期結算 / 待驗證』）：")
 st.dataframe(pd.DataFrame(period_records), use_container_width=True, height=400)
