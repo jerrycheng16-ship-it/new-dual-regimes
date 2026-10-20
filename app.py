@@ -442,3 +442,194 @@ def fetch_real_market_data():
     macro_df = df_prices[macro_cols].reindex(returns_df.index).ffill().bfill()
     macro_df['Yield_Curve'] = 0.5 
     macro_df['Inflation'] = 2.0
+    
+    return returns_df.dropna(), macro_df.dropna()
+
+with st.spinner("正在同步真實金融市場與總經歷史數據..."):
+    raw_returns_df, raw_macro_df = fetch_real_market_data()
+
+start_ts = pd.to_datetime(start_date)
+end_ts = pd.to_datetime(end_date)
+common_index = raw_returns_df.index.intersection(raw_macro_df.index)
+clean_returns = raw_returns_df.loc[common_index]
+clean_macro = raw_macro_df.loc[common_index]
+
+mask = (clean_returns.index >= start_ts) & (clean_returns.index <= end_ts)
+returns_df_input = clean_returns.loc[mask].copy()
+macro_df_input = clean_macro.loc[mask].copy()
+
+if returns_df_input.empty or len(returns_df_input) < 30:
+    st.error("❌ 選擇的時間區間內真實資料不足，請擴大回測起訖日期！")
+    st.stop()
+
+if run_button or 'results' not in st.session_state:
+    with st.spinner(f"正在執行 Walk-Forward 嚴格歷史鎖定運算 (模式：{defense_option} | 頻率：{rebal_freq_option})..."):
+        model_instance = DualRegimeAllocationModel(
+            jump_penalty_global=float(jp_global),
+            jump_penalty_asset=float(jp_asset),
+            prob_threshold=float(prob_thresh),
+            ewm_window=int(ewm_win),
+            rebalance_freq=chosen_freq,
+            momentum_lookback=int(mom_lb),
+            defense_mode=chosen_defense_mode
+        )
+        res_df, bmda_hist, bmga_hist, rebal_dates, returns_aligned, raw_probs = model_instance.run_pipeline(
+            returns_df_input.copy(), macro_df_input.copy(), global_proxy_col='S&P500', riskfree_col='RiskFree'
+        )
+        st.session_state['results'] = res_df
+        st.session_state['bmda'] = bmda_hist
+        st.session_state['bmga'] = bmga_hist
+        st.session_state['rebal_dates'] = rebal_dates
+        st.session_state['returns_aligned'] = returns_aligned
+        st.session_state['raw_probs'] = raw_probs
+
+res_df = st.session_state['results']
+bmda_hist = st.session_state['bmda']
+bmga_hist = st.session_state['bmga']
+rebal_dates = st.session_state['rebal_dates']
+returns_aligned = st.session_state['returns_aligned']
+raw_probs = st.session_state['raw_probs']
+
+# ==========================================
+# 3. 顯示網頁頂端：最近一個週期的訊號與建議配置
+# ==========================================
+st.markdown("---")
+period_name = "最近一月" if chosen_freq == "Monthly" else ("最近一週" if chosen_freq == "Weekly" else "最近一日")
+st.subheader(f"🎯 依據【{rebal_freq_option}】產生的【{period_name}】市場訊號與建議配置")
+
+dates_index = sorted(list(returns_aligned.index))
+latest_signal_date = dates_index[-1] 
+
+latest_prob = raw_probs[-1] if len(raw_probs) > 0 else 0.5
+is_latest_bear = latest_prob < 0.5
+latest_state = "🐻 熊市防禦 (BMDA)" if is_latest_bear else "🚀 牛市成長 (BMGA)"
+latest_assets = bmda_hist.get(latest_signal_date, []) if is_latest_bear else bmga_hist.get(latest_signal_date, [])
+
+c1, c2, c3 = st.columns(3)
+c1.metric("最新訊號生成日", latest_signal_date.strftime('%Y-%m-%d'))
+c2.metric("模型牛市預測機率", f"{latest_prob:.4f}", latest_state)
+c3.metric("建議配置資產池", ", ".join(latest_assets))
+st.markdown("---")
+
+# ==========================================
+# 4. 績效與預測勝率計算
+# ==========================================
+cum_returns = (1 + res_df['Return']).cumprod()
+annual_factor = 12 if chosen_freq == "Monthly" else (52 if chosen_freq == "Weekly" else 252)
+sharpe = (res_df['Return'].mean() * annual_factor) / (res_df['Return'].std() * np.sqrt(annual_factor)) if res_df['Return'].std() > 0 else 0
+max_dd = (cum_returns / cum_returns.cummax() - 1).min()
+annual_ret = (cum_returns.iloc[-1] ** (annual_factor / len(res_df))) - 1 if len(res_df) > 0 else 0
+avg_turnover = res_df['Turnover'].mean()
+
+benchmark_returns = returns_aligned.loc[res_df.index, 'S&P500']
+benchmark_cum = (1 + benchmark_returns).cumprod()
+benchmark_sharpe = (benchmark_returns.mean() * annual_factor) / (benchmark_returns.std() * np.sqrt(annual_factor)) if benchmark_returns.std() > 0 else 0
+benchmark_max_dd = (benchmark_cum / benchmark_cum.cummax() - 1).min()
+benchmark_annual_ret = (benchmark_cum.iloc[-1] ** (annual_factor / len(benchmark_cum))) - 1 if len(benchmark_cum) > 0 else 0
+
+correct_count = 0
+total_count = 0
+period_records = []
+
+dates_list = sorted(list(returns_aligned.index))
+for i in range(len(dates_list)):
+    d_signal = dates_list[i]     
+    
+    if i < len(dates_list) - 1:
+        d_next = dates_list[i+1]     
+        prob = res_df.loc[d_next, 'Global_Bull_Prob'] if d_next in res_df.index else raw_probs[i]
+        period_sp_ret = returns_aligned.loc[d_next, 'S&P500'] if d_next in returns_aligned.index else 0.0
+        
+        is_bull_pred = prob >= 0.5
+        is_up = period_sp_ret > 0
+        is_down = period_sp_ret < 0
+        
+        if (is_bull_pred and is_up) or (not is_bull_pred and is_down):
+            eval_result = "✅ 正確"
+            correct_count += 1
+            total_count += 1
+        elif period_sp_ret == 0:
+            eval_result = "➖ 持平"
+        else:
+            eval_result = "❌ 錯誤"
+            total_count += 1
+            
+        ret_str = f"{period_sp_ret * 100:.2f}%"
+        future_str = d_next.strftime('%Y-%m-%d')
+    else:
+        prob = raw_probs[i] if i < len(raw_probs) else 0.5
+        future_str = "⏳ 待下期結算"
+        ret_str = "N/A"
+        eval_result = "⏳ 待驗證"
+
+    is_bear = prob < 0.5
+    regime_str = "🐻 熊市防禦 (BMDA)" if is_bear else "🚀 牛市成長 (BMGA)"
+    assets = bmda_hist.get(d_signal, []) if is_bear else bmga_hist.get(d_signal, [])
+    
+    period_records.append({
+        "訊號生成日 (結算)": d_signal.strftime('%Y-%m-%d'),
+        "預驗證未來區間": future_str,
+        "牛市預測機率": f"{prob:.4f}",
+        "市場判定狀態": regime_str,
+        "S&P500 下期報酬率": ret_str,
+        "預測驗證": eval_result,
+        "當期配置資產池": ", ".join(assets)
+    })
+
+period_records.reverse()
+win_rate = (correct_count / total_count) * 100 if total_count > 0 else 0
+
+st.subheader(f"📊 核心績效指標與預測勝率 ({rebal_freq_option})")
+col1, col2, col3, col4, col5 = st.columns(5)
+col1.metric("年化夏普值", f"{sharpe:.2f}", f"大盤基準: {benchmark_sharpe:.2f}")
+col2.metric("最大回撤", f"{max_dd * 100:.2f}%", f"大盤基準: {benchmark_max_dd * 100:.2f}%")
+col3.metric("年化報酬率", f"{annual_ret * 100:.2f}%", f"大盤基準: {benchmark_annual_ret * 100:.2f}%")
+col4.metric("平均換手率", f"{avg_turnover * 100:.2f}%")
+col5.metric("多空預測勝率", f"{win_rate:.2f}%", f"正確數: {correct_count}/{total_count}")
+
+st.markdown("---")
+
+st.subheader("📈 累積淨值曲線對比")
+comparison_df = pd.DataFrame({
+    f"動態配置策略 ({chosen_defense_mode})": cum_returns,
+    "S&P 500 (買入持有)": benchmark_cum
+})
+fig_wealth = px.line(comparison_df, labels={"value": "累積淨值", "index": "日期", "variable": "策略類型"})
+fig_wealth.update_layout(height=450, template="plotly_dark", legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1))
+st.plotly_chart(fig_wealth, use_container_width=True)
+
+st.subheader("🌍 全球市場多空狀態歷史判定圖")
+fig_regime = make_subplots(
+    rows=2, cols=1, 
+    shared_xaxes=True, 
+    vertical_spacing=0.08,
+    row_heights=[0.7, 0.3],
+    subplot_titles=("S&P 500 走勢", "模型預測牛市機率 (Prob Bull)")
+)
+
+sp_prices_plot = (1 + benchmark_returns).cumprod()
+fig_regime.add_trace(
+    go.Scatter(x=sp_prices_plot.index, y=sp_prices_plot, name="S&P 500 走勢", line=dict(color='#1f77b4', width=2)),
+    row=1, col=1
+)
+
+bull_probs = res_df['Global_Bull_Prob']
+fig_regime.add_trace(
+    go.Scatter(x=bull_probs.index, y=bull_probs, name="牛市機率", line=dict(color='#ff7f0e', width=1.5)),
+    row=2, col=1
+)
+fig_regime.add_hline(y=0.5, line_dash="dash", line_color="gray", row=2, col=1, annotation_text="多空分界線 (0.5)")
+
+fig_regime.update_layout(
+    template="plotly_dark",
+    height=550,
+    hovermode="x unified",
+    legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
+)
+st.plotly_chart(fig_regime, use_container_width=True)
+
+st.markdown("---")
+
+st.subheader(f"📋 週期結算、預測與未來報酬驗證明細表 ({rebal_freq_option})")
+st.caption("明細表中已啟用歷史訊號永久鎖定，過去各結算日的訊號將固定不變：")
+st.dataframe(pd.DataFrame(period_records), use_container_width=True, height=400)
